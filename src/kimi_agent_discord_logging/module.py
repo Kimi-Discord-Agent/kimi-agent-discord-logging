@@ -150,16 +150,16 @@ class DiscordLoggingModule:
             registration.close()
         self._registrations.clear()
         current = asyncio.current_task()
-        active_handlers = tuple(task for task in self._active_handlers if task is not current)
-        if active_handlers:
-            await asyncio.gather(*active_handlers, return_exceptions=True)
-        self._active_handlers.clear()
         tasks = tuple(self._maintenance_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._maintenance_tasks.clear()
+        active_handlers = tuple(task for task in self._active_handlers if task is not current)
+        if active_handlers:
+            await asyncio.gather(*active_handlers, return_exceptions=True)
+        self._active_handlers.clear()
         self._message_locks.clear()
         self._invite_locks.clear()
         self._invite_tracker = InviteTracker()

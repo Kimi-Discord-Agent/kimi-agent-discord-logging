@@ -498,6 +498,40 @@ async def test_close_waits_for_inflight_event_handlers(
     assert started.module._ctx is None
 
 
+async def test_close_cancels_lock_holding_maintenance_before_draining_handlers(
+    started: Harness,
+) -> None:
+    lock = started.module._message_locks.setdefault(GUILD, asyncio.Lock())
+    maintenance_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def maintenance() -> None:
+        async with lock:
+            maintenance_started.set()
+            await never.wait()
+
+    maintenance_task = asyncio.create_task(maintenance())
+    started.module._maintenance_tasks.add(maintenance_task)
+    await maintenance_started.wait()
+    delivery = asyncio.create_task(
+        _deliver(started, TOPIC_MESSAGE, MessageEvent(_message(), author_is_bot=False))
+    )
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(started.module.close())
+
+    try:
+        await asyncio.wait_for(asyncio.shield(closing), timeout=0.2)
+    finally:
+        if not maintenance_task.done():
+            maintenance_task.cancel()
+            await asyncio.gather(maintenance_task, return_exceptions=True)
+        if not closing.done():
+            await closing
+        await delivery
+
+    assert started.module._ctx is None
+
+
 async def test_message_work_in_different_guilds_does_not_share_a_lock(
     started: Harness,
     monkeypatch: pytest.MonkeyPatch,
