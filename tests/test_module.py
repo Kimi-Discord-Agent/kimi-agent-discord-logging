@@ -378,6 +378,52 @@ async def test_logging_and_ignored_channels_are_not_snapshotted(started: Harness
     assert await store.get(logging_message.ref) is None
 
 
+async def test_uncached_thread_bulk_delete_resolves_ignored_parent_before_logging(
+    started: Harness,
+) -> None:
+    thread_id = SOURCE_CHANNEL + 1
+    started.discord.channels[GUILD, thread_id] = ChannelSnapshot(
+        GUILD,
+        thread_id,
+        "thread",
+        "private-thread",
+        parent_channel_id=SOURCE_CHANNEL,
+    )
+    started.guild_settings.set(GUILD, **{FIELD_IGNORED_CHANNELS: [SOURCE_CHANNEL]})
+
+    await _deliver(
+        started,
+        TOPIC_MESSAGE_BULK_DELETE,
+        MessageBulkDeleteEvent(
+            (MessageRef(GUILD, thread_id, 31), MessageRef(GUILD, thread_id, 32))
+        ),
+    )
+
+    assert _sent_embeds(started) == []
+
+
+async def test_uncached_thread_delete_resolves_ignored_parent_before_logging(
+    started: Harness,
+) -> None:
+    thread_id = SOURCE_CHANNEL + 1
+    started.discord.channels[GUILD, thread_id] = ChannelSnapshot(
+        GUILD,
+        thread_id,
+        "thread",
+        "private-thread",
+        parent_channel_id=SOURCE_CHANNEL,
+    )
+    started.guild_settings.set(GUILD, **{FIELD_IGNORED_CHANNELS: [SOURCE_CHANNEL]})
+
+    await _deliver(
+        started,
+        TOPIC_MESSAGE_DELETE,
+        MessageDeleteEvent(MessageRef(GUILD, thread_id, 30), None, None, ()),
+    )
+
+    assert _sent_embeds(started) == []
+
+
 async def test_ignored_parent_channel_excludes_its_threads(started: Harness) -> None:
     thread_id = SOURCE_CHANNEL + 1
     thread_message = MessageSnapshot(
@@ -418,6 +464,38 @@ async def test_ignored_parent_excludes_fetched_bot_edit_snapshot(started: Harnes
 
     assert await SnapshotStore(started.storage).get(raw_ref) is None
     assert _sent_embeds(started) == []
+
+
+async def test_close_waits_for_inflight_event_handlers(
+    started: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_store = started.module._store
+
+    async def controlled_store(message: MessageSnapshot) -> None:
+        entered.set()
+        await release.wait()
+        await original_store(message)
+
+    monkeypatch.setattr(started.module, "_store", controlled_store)
+    delivery = asyncio.create_task(
+        _deliver(started, TOPIC_MESSAGE, MessageEvent(_message(), author_is_bot=False))
+    )
+    await entered.wait()
+
+    closing = asyncio.create_task(started.module.close())
+    await asyncio.sleep(0)
+
+    try:
+        assert not closing.done()
+    finally:
+        release.set()
+        await delivery
+        await closing
+
+    assert started.module._ctx is None
 
 
 async def test_message_work_in_different_guilds_does_not_share_a_lock(

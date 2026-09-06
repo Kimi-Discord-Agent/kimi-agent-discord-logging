@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from kimi_agent_module_api import (
@@ -89,6 +89,8 @@ class DiscordLoggingModule:
         self._snapshots: SnapshotStore | None = None
         self._registrations: list[Registration] = []
         self._maintenance_tasks: set[asyncio.Task[None]] = set()
+        self._active_handlers: set[asyncio.Task[Any]] = set()
+        self._closing = False
         self._message_locks: dict[int, asyncio.Lock] = {}
         self._invite_locks: dict[int, asyncio.Lock] = {}
         self._invite_tracker = InviteTracker()
@@ -101,17 +103,18 @@ class DiscordLoggingModule:
     async def start(self, ctx: ModuleRuntimeContext) -> None:
         if self._ctx is not None:
             raise RuntimeError(f"{MODULE_NAME} is already started")
+        self._closing = False
         self._ctx = ctx
         self._snapshots = SnapshotStore(ctx.storage)
         self._registrations.extend(
             (
-                ctx.events.subscribe(TOPIC_MESSAGE, self._on_message),
-                ctx.events.subscribe(TOPIC_MESSAGE_EDIT, self._on_message_edit),
-                ctx.events.subscribe(TOPIC_MESSAGE_DELETE, self._on_message_delete),
-                ctx.events.subscribe(TOPIC_MESSAGE_BULK_DELETE, self._on_bulk_delete),
-                ctx.events.subscribe(TOPIC_INVITE_CREATE, self._on_invite_create),
-                ctx.events.subscribe(TOPIC_INVITE_DELETE, self._on_invite_delete),
-                ctx.events.subscribe(TOPIC_MEMBER_JOIN, self._on_member_join),
+                self._subscribe(ctx, TOPIC_MESSAGE, self._on_message),
+                self._subscribe(ctx, TOPIC_MESSAGE_EDIT, self._on_message_edit),
+                self._subscribe(ctx, TOPIC_MESSAGE_DELETE, self._on_message_delete),
+                self._subscribe(ctx, TOPIC_MESSAGE_BULK_DELETE, self._on_bulk_delete),
+                self._subscribe(ctx, TOPIC_INVITE_CREATE, self._on_invite_create),
+                self._subscribe(ctx, TOPIC_INVITE_DELETE, self._on_invite_delete),
+                self._subscribe(ctx, TOPIC_MEMBER_JOIN, self._on_member_join),
                 ctx.interactions.add_command(
                     CommandSpec(
                         name="setup",
@@ -142,9 +145,15 @@ class DiscordLoggingModule:
         self._report_health()
 
     async def close(self) -> None:
+        self._closing = True
         for registration in reversed(self._registrations):
             registration.close()
         self._registrations.clear()
+        current = asyncio.current_task()
+        active_handlers = tuple(task for task in self._active_handlers if task is not current)
+        if active_handlers:
+            await asyncio.gather(*active_handlers, return_exceptions=True)
+        self._active_handlers.clear()
         tasks = tuple(self._maintenance_tasks)
         for task in tasks:
             task.cancel()
@@ -156,6 +165,26 @@ class DiscordLoggingModule:
         self._invite_tracker = InviteTracker()
         self._snapshots = None
         self._ctx = None
+
+    def _subscribe(
+        self,
+        ctx: ModuleRuntimeContext,
+        topic: str,
+        handler: Callable[[Event], Awaitable[None]],
+    ) -> Registration:
+        async def tracked(event: Event) -> None:
+            if self._closing:
+                return
+            task = asyncio.current_task()
+            if task is not None:
+                self._active_handlers.add(task)
+            try:
+                await handler(event)
+            finally:
+                if task is not None:
+                    self._active_handlers.discard(task)
+
+        return ctx.events.subscribe(topic, tracked)
 
     async def _on_message(self, event: Event) -> None:
         payload = event.payload
@@ -280,7 +309,11 @@ class DiscordLoggingModule:
                 await snapshots.delete(ref)
                 self._report_health()
                 return
-            effective_ref = stored.ref if stored is not None else ref
+            effective_ref = stored.ref if stored is not None else await self._resolve_raw_ref(ref)
+            if effective_ref is None:
+                self._snapshots_missed += 1
+                self._report_health()
+                return
             if not self._tracks_message(effective_ref):
                 if stored is not None:
                     await snapshots.delete(ref)
@@ -344,7 +377,10 @@ class DiscordLoggingModule:
                 if not refs:
                     self._report_health()
                     return
-            effective_ref = stored[0].ref if stored else refs[0]
+            effective_ref = stored[0].ref if stored else await self._resolve_raw_ref(refs[0])
+            if effective_ref is None:
+                self._report_health()
+                return
             should_log = self._tracks_message(effective_ref) and self._guild_values(guild_id).get(
                 FIELD_LOG_BULK_DELETES, True
             )
@@ -723,6 +759,49 @@ class DiscordLoggingModule:
 
     def _message_lock_for(self, guild_id: int) -> asyncio.Lock:
         return self._message_locks.setdefault(guild_id, asyncio.Lock())
+
+    async def _resolve_raw_ref(self, ref: MessageRef) -> MessageRef | None:
+        """Resolve a raw event's thread parent or fail closed before privacy filtering."""
+        ctx, _ = self._require_started()
+        health_key = self._guild_health_key("channel_classification", ref.guild_id)
+        try:
+            channel = await ctx.discord.fetch_channel(ref.guild_id, ref.channel_id)
+        except Exception:
+            log.warning(
+                "Could not classify raw message channel %s in guild %s",
+                ref.channel_id,
+                ref.guild_id,
+                exc_info=True,
+            )
+            ctx.health.report(
+                "degraded",
+                f"Could not classify raw message channel {ref.channel_id} in guild {ref.guild_id}.",
+                key=health_key,
+            )
+            return None
+        if channel is None:
+            ctx.health.report(
+                "degraded",
+                f"Could not classify raw message channel {ref.channel_id} in guild {ref.guild_id}.",
+                key=health_key,
+            )
+            return None
+        if channel.kind == "thread":
+            if channel.parent_channel_id is None:
+                ctx.health.report(
+                    "degraded",
+                    f"Thread {ref.channel_id} in guild {ref.guild_id} has no parent classification.",
+                    key=health_key,
+                )
+                return None
+            ref = MessageRef(
+                ref.guild_id,
+                ref.channel_id,
+                ref.message_id,
+                parent_channel_id=channel.parent_channel_id,
+            )
+        ctx.health.report("healthy", key=health_key)
+        return ref
 
     def _invite_lock_for(self, guild_id: int) -> asyncio.Lock:
         return self._invite_locks.setdefault(guild_id, asyncio.Lock())
