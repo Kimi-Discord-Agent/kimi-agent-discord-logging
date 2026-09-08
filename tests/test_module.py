@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 from conftest import (
@@ -90,6 +91,69 @@ async def test_start_registers_events_command_job_and_invite_baseline(started: H
     assert started.interactions.commands["logging.setup"][0].min_tier == "staff"
     assert started.scheduler.jobs[PRUNE_JOB_KEY].handler == PRUNE_HANDLER
     assert len(started.discord.calls_for("fetch_invites")) == 1
+
+
+@pytest.mark.parametrize(
+    "members_intent,advertised", [(False, False), (False, True), (True, False)]
+)
+async def test_without_members_starts_message_logging_without_join_fetches(
+    started: Harness, members_intent: bool, advertised: bool
+) -> None:
+    await started.module.close()
+    capabilities = started.ctx.capabilities
+    available = capabilities.available - {"discord.members.v1"}
+    if advertised:
+        available = available | {"discord.members.v1"}
+    ctx = replace(
+        started.ctx,
+        capabilities=replace(
+            capabilities, available=frozenset(available), members_intent=members_intent
+        ),
+    )
+    fetches = len(started.discord.calls_for("fetch_invites"))
+    await started.module.start(ctx)
+    assert TOPIC_MEMBER_JOIN not in started.events.subscriptions
+    assert started.health.keyed[f"member_joins:{GUILD}"].state == "degraded"
+    assert len(started.discord.calls_for("fetch_invites")) == fetches
+    message = _message()
+    await _deliver(started, TOPIC_MESSAGE, MessageEvent(message, author_is_bot=False))
+    await _deliver(
+        started,
+        TOPIC_MESSAGE_EDIT,
+        MessageEditEvent(message.ref, AUTHOR, "before", "after", started.clock.now),
+    )
+    assert _sent_embeds(started)[-1].title == "Message edited"
+    await _deliver(started, TOPIC_MESSAGE_DELETE, MessageDeleteEvent(message.ref, None, None, ()))
+    assert _sent_embeds(started)[-1].title == "Message deleted"
+    message = _message(2)
+    await _deliver(started, TOPIC_MESSAGE, MessageEvent(message, author_is_bot=False))
+    await _deliver(started, TOPIC_MESSAGE_BULK_DELETE, MessageBulkDeleteEvent((message.ref,)))
+    invite = started.discord.invites[GUILD][0]
+    await _deliver(started, TOPIC_INVITE_CREATE, InviteCreateEvent(invite))
+    await _deliver(started, TOPIC_INVITE_DELETE, InviteDeleteEvent(invite))
+    assert len(_sent_embeds(started)) == 5
+    assert len(started.discord.calls_for("fetch_invites")) == fetches
+    # A late or manually dispatched join cannot bypass the capability gate.
+    joins = MemberJoinEvent(
+        MemberSnapshot(GUILD, MEMBER, "new member", (), False, None, None),
+        account_created_at=0.0,
+    )
+    assert await started.events.deliver(TOPIC_MEMBER_JOIN, joins) == 0
+    # Per-guild opt-out acknowledges the unavailable optional feature.
+    started.guild_settings.set(GUILD, **{FIELD_LOG_MEMBER_JOINS: False})
+    await started.module._reconcile_changed_guild(GUILD)
+    assert f"member_joins:{GUILD}" not in started.health.keyed
+    assert started.health.state == "healthy"
+    other = replace(message, ref=MessageRef(GUILD + 1, SOURCE_CHANNEL, 3))
+    await _deliver(started, TOPIC_MESSAGE, MessageEvent(other, author_is_bot=False))
+    await _deliver(
+        started, TOPIC_MESSAGE_DELETE, MessageDeleteEvent(other.ref, AUTHOR, "private", ())
+    )
+    await _deliver(
+        started, TOPIC_INVITE_CREATE, InviteCreateEvent(replace(invite, guild_id=GUILD + 1))
+    )
+    assert await SnapshotStore(started.storage).get(other.ref) is None
+    assert len(_sent_embeds(started)) == 5
 
 
 async def test_bot_message_is_snapshotted_for_delete_classification(started: Harness) -> None:

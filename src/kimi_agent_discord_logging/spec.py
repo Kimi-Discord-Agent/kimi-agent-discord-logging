@@ -16,7 +16,7 @@ from kimi_agent_module_api.events import (
 from kimi_agent_discord_logging.guild_settings import GUILD_SETTINGS
 from kimi_agent_discord_logging.module import MODULE_NAME, DiscordLoggingModule
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def create(_ctx: ModuleLoadContext) -> AppModule:
@@ -28,7 +28,7 @@ SPEC = ModuleSpec(
     version=VERSION,
     create=create,
     api_version=2,
-    activation_capabilities=("discord.members.v1", "discord.message_content.v1"),
+    activation_capabilities=("discord.message_content.v1",),
     permissions=ModulePermissions(
         discord_actions=frozenset(
             {"send_message", "fetch_message", "fetch_channel", "fetch_invites"}

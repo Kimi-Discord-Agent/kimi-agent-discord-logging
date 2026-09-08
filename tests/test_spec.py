@@ -30,10 +30,7 @@ def test_declarations_pass_host_preflight() -> None:
     validate_guild_settings_schema(SPEC.name, SPEC.guild_settings)
     for topic in SPEC.permissions.event_topics:
         validate_subscription(SPEC.name, SPEC.permissions, topic)
-    assert SPEC.activation_capabilities == (
-        "discord.members.v1",
-        "discord.message_content.v1",
-    )
+    assert SPEC.activation_capabilities == ("discord.message_content.v1",)
     assert "fetch_channel" in SPEC.permissions.discord_actions
 
 

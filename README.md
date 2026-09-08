@@ -26,8 +26,8 @@ The module gives the AI no tools and never sends message content to a model.
 You need:
 
 - A Kimi installation that supports module API version 2, on Python 3.14 or newer.
-- The bot's **Server Members Intent** and **Message Content Intent**, turned on
-  both in Kimi's environment file and in the Discord Developer Portal.
+- **Message Content Intent**, enabled in Kimi and the Discord Developer Portal.
+- Optional **Server Members Intent** only for member joins and invite-use attribution.
 - Permission to install a Python package into the environment that runs Kimi.
 - A logging channel in each server that should use the module.
 
@@ -74,13 +74,22 @@ KIMI_MODULES=moderation,discord_logging
 In the same environment file:
 
 ```dotenv
-MEMBERS_INTENT=true
+MEMBERS_INTENT=false
 MESSAGE_CONTENT_INTENT=true
 ```
 
-Then enable **Server Members Intent** and **Message Content Intent** in the Discord
-Developer Portal under **Bot → Privileged Gateway Intents**. If either is missing,
-Kimi leaves the module off and explains why in `/modules status`.
+Enable **Message Content Intent** in the Discord Developer Portal under
+**Bot → Privileged Gateway Intents**. Without it, Kimi leaves the module off.
+
+**Server Members Intent is optional.** With it off, message edits, deletions,
+bulk deletions and invite create/delete events still work. Set
+`log_member_joins: false` in each configured server to acknowledge that joins and
+invite-use attribution are disabled. No member subscription or invite-counter
+fetch is made in this mode. If joins are requested without the intent, a
+per-server health warning explains the missing feature without stopping logging.
+
+For member joins, enable `MEMBERS_INTENT=true` and Server Members Intent in the
+portal, then restart. Existing servers with that intent retain their behavior.
 
 ### 4. Give the bot permissions
 
@@ -92,9 +101,9 @@ edit but forgets the old attachment list, so a removed attachment cannot show up
 later in a deletion log by mistake.
 
 For invite logging: **Manage Channels** in the channels where invites are made, so
-Discord sends the invite events, and **Manage Server** so the bot can read invite
-use counts. Without **Manage Server**, join logs still appear but say the invite
-is unknown.
+Discord sends the invite events. **Manage Server** is needed only for invite-use
+attribution when member joins are enabled. Without it, join logs still appear
+but say the invite is unknown.
 
 ### 5. Configure each server
 
@@ -116,7 +125,7 @@ log_deletes: true
 log_bulk_deletes: true
 log_invite_create: true
 log_invite_delete: true
-log_member_joins: true
+log_member_joins: false
 ignore_bots: true
 ignored_channel_ids: []
 snapshot_retention_days: 30
@@ -131,7 +140,7 @@ snapshot_retention_days: 30
 | `log_bulk_deletes` | `true` | Post bulk-delete summaries. |
 | `log_invite_create` | `true` | Post invite-create logs. |
 | `log_invite_delete` | `true` | Post invite-delete logs. |
-| `log_member_joins` | `true` | Post join logs with invite attribution. |
+| `log_member_joins` | `true` | Post join logs with invite attribution when Server Members Intent is available. Set false for message/invite-event-only operation. |
 | `ignore_bots` | `true` | Skip edit and delete logs for messages written by bots. |
 | `ignored_channel_ids` | `[]` | Channels that are never stored or logged. Ignoring a channel also covers its threads. |
 | `snapshot_retention_days` | `30` | How long temporary message copies are kept, from 1 to 365. |
@@ -246,7 +255,7 @@ module's code before enabling it.
 | Symptom | What to check |
 |---|---|
 | Startup says the entry point is missing | The package must be installed into the interpreter that runs the service. From `bot/`, run `.venv/bin/python -c "import importlib.metadata as m; print([e.name for e in m.entry_points(group='kimi_agent.modules')])"`. |
-| Module shows as soft-disabled | Enable both intents in the environment file and the Developer Portal, then restart. `/modules status` names what is missing. |
+| Module shows as soft-disabled | Enable Message Content Intent in the environment file and the Developer Portal, then restart. `/modules status` names what is missing. |
 | Module is healthy but nothing is posted | Check the server file has `logging_channel_id`, the channel is not ignored, the matching `log_*` field is true, `ignore_bots` is not excluding the author, and the bot can view, send, and embed there. |
 | Delivery health is degraded, or Discord returns `403 Missing Access` | Recheck the bot's role and channel permissions for the logging channel. Health is tracked per server. |
 | No invite create or delete logs | Grant **Manage Channels** where invites are made. |
@@ -290,8 +299,9 @@ handlers and commands. Daily cleanup uses Kimi's scheduler, so it survives
 restarts. Each server has its own message and invite locks, so events in one
 server stay ordered without blocking others.
 
-The module declares only what it uses: capabilities `discord.members.v1` and
-`discord.message_content.v1`; Discord actions `send_message`, `fetch_message`,
+The module requires `discord.message_content.v1` for activation and checks
+`discord.members.v1` plus the host members-intent flag only for join features.
+It declares Discord actions `send_message`, `fetch_message`,
 `fetch_channel`, and `fetch_invites`; seven `discord.*` event topics; and no
 direct bot or database access, outbound hosts, AI tools, or other modules.
 

@@ -114,7 +114,6 @@ class DiscordLoggingModule:
                 self._subscribe(ctx, TOPIC_MESSAGE_BULK_DELETE, self._on_bulk_delete),
                 self._subscribe(ctx, TOPIC_INVITE_CREATE, self._on_invite_create),
                 self._subscribe(ctx, TOPIC_INVITE_DELETE, self._on_invite_delete),
-                self._subscribe(ctx, TOPIC_MEMBER_JOIN, self._on_member_join),
                 ctx.interactions.add_command(
                     CommandSpec(
                         name="setup",
@@ -130,6 +129,10 @@ class DiscordLoggingModule:
                 ),
             )
         )
+        if self._members_available():
+            self._registrations.append(
+                self._subscribe(ctx, TOPIC_MEMBER_JOIN, self._on_member_join)
+            )
         if ctx.guild_settings is not None:
             self._registrations.append(ctx.guild_settings.on_change(self._on_guild_change))
         ctx.scheduler.register(PRUNE_HANDLER, self._prune_snapshots)
@@ -630,18 +633,26 @@ class DiscordLoggingModule:
         value = self._guild_values(guild_id).get(FIELD_LOGGING_CHANNEL)
         return int(value) if value else None
 
+    def _members_available(self) -> bool:
+        ctx = self._ctx
+        return (
+            ctx is not None
+            and ctx.capabilities.members_intent
+            and "discord.members.v1" in ctx.capabilities.available
+        )
+
     def _logs_member_joins(self, guild_id: int) -> bool:
-        return self._logging_channel(guild_id) is not None and bool(
-            self._guild_values(guild_id).get(FIELD_LOG_MEMBER_JOINS, True)
+        return (
+            self._members_available()
+            and self._logging_channel(guild_id) is not None
+            and bool(self._guild_values(guild_id).get(FIELD_LOG_MEMBER_JOINS, True))
         )
 
     def _retains_invite_state(self, guild_id: int) -> bool:
         if self._logging_channel(guild_id) is None:
             return False
         values = self._guild_values(guild_id)
-        return bool(
-            values.get(FIELD_LOG_INVITE_DELETE, True) or values.get(FIELD_LOG_MEMBER_JOINS, True)
-        )
+        return bool(values.get(FIELD_LOG_INVITE_DELETE, True) or self._logs_member_joins(guild_id))
 
     def _tracks_messages(self, guild_id: int) -> bool:
         values = self._guild_values(guild_id)
@@ -735,6 +746,20 @@ class DiscordLoggingModule:
     async def _sync_invite_tracking(self, guild_id: int) -> None:
         ctx, _ = self._require_started()
         health_key = self._guild_health_key("invites", guild_id)
+        member_key = self._guild_health_key("member_joins", guild_id)
+        if (
+            self._logging_channel(guild_id) is not None
+            and self._guild_values(guild_id).get(FIELD_LOG_MEMBER_JOINS, True)
+            and not self._members_available()
+        ):
+            ctx.health.report(
+                "degraded",
+                "Member joins and invite attribution are unavailable without Server Members "
+                "Intent; set log_member_joins=false to use message and invite-event logging only.",
+                key=member_key,
+            )
+        else:
+            ctx.health.report("healthy", key=member_key)
         if not self._retains_invite_state(guild_id):
             self._invite_tracker.invalidate(guild_id)
         if not self._logs_member_joins(guild_id):
