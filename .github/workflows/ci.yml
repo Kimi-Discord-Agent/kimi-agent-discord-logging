@@ -16,7 +16,7 @@ permissions:
 jobs:
   check:
     name: lint + types + tests + build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, homelab]
     timeout-minutes: 10
 
     steps:
